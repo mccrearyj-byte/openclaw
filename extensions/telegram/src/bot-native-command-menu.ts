@@ -10,6 +10,9 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
 import { normalizeTelegramCommandName, TELEGRAM_COMMAND_NAME_PATTERN } from "./command-config.js";
+import { getTelegramRuntime } from "./runtime.js";
+import { normalizeTelegramStateAccountId } from "./state-account-id.js";
+import { fingerprintTelegramBotToken } from "./token-fingerprint.js";
 
 const TELEGRAM_MAX_COMMANDS = 100;
 const TELEGRAM_TOTAL_COMMAND_TEXT_BUDGET = 5700;
@@ -338,25 +341,45 @@ function hashCommandList(commands: TelegramMenuCommand[]): string {
   return createHash("sha256").update(JSON.stringify(sorted)).digest("hex").slice(0, 16);
 }
 
-// Keep the sync cache process-local so restarts always re-register commands.
-const syncedCommandHashes = new Map<string, string>();
+const TELEGRAM_COMMAND_MENU_SYNC_CACHE_NAMESPACE = "telegram.command-menu-sync";
+const TELEGRAM_COMMAND_MENU_SYNC_CACHE_MAX_ENTRIES = 256;
+
+type TelegramCommandMenuSyncState = { hash: string };
+
+function openCommandMenuSyncStore() {
+  return getTelegramRuntime().state.openKeyedStore<TelegramCommandMenuSyncState>({
+    namespace: TELEGRAM_COMMAND_MENU_SYNC_CACHE_NAMESPACE,
+    maxEntries: TELEGRAM_COMMAND_MENU_SYNC_CACHE_MAX_ENTRIES,
+  });
+}
 
 function getCommandHashKey(accountId?: string, botIdentity?: string): string {
-  return `${accountId ?? "default"}:${botIdentity ?? ""}`;
+  // Fingerprint the token instead of persisting it: this key lives in the
+  // shared state DB, not process memory.
+  const tokenFingerprint = botIdentity ? fingerprintTelegramBotToken(botIdentity) : "";
+  return `${normalizeTelegramStateAccountId(accountId)}:${tokenFingerprint}`;
 }
 
-function readCachedCommandHash(accountId?: string, botIdentity?: string): string | null {
+// Persisted (not process-local): a crash-looping or frequently restarted
+// gateway must still recognize an unchanged command list across restarts,
+// or every restart re-issues the delete+set calls this cache exists to
+// avoid. See: openclaw/openclaw#32017
+async function readCachedCommandHash(
+  accountId?: string,
+  botIdentity?: string,
+): Promise<string | null> {
   const key = getCommandHashKey(accountId, botIdentity);
-  return syncedCommandHashes.get(key) ?? null;
+  const entry = await openCommandMenuSyncStore().lookup(key);
+  return entry?.hash ?? null;
 }
 
-function writeCachedCommandHash(
+async function writeCachedCommandHash(
   accountId: string | undefined,
   botIdentity: string | undefined,
   hash: string,
-): void {
+): Promise<void> {
   const key = getCommandHashKey(accountId, botIdentity);
-  syncedCommandHashes.set(key, hash);
+  await openCommandMenuSyncStore().register(key, { hash });
 }
 
 function normalizeTelegramLanguageCode(languageCode: string): string | null {
@@ -503,7 +526,7 @@ export function syncTelegramMenuCommands(params: {
     // is restarted several times in quick succession.
     // See: openclaw/openclaw#32017
     const currentHash = hashCommandList(commandsToRegister);
-    const cachedHash = readCachedCommandHash(accountId, botIdentity);
+    const cachedHash = await readCachedCommandHash(accountId, botIdentity);
     if (cachedHash === currentHash) {
       logVerbose("telegram: command menu unchanged; skipping sync");
       return;
@@ -520,7 +543,7 @@ export function syncTelegramMenuCommands(params: {
       if (typeof bot.api.deleteMyCommands !== "function") {
         await setTelegramMenuCommandsForScopes({ bot, runtime, commands: [] });
       }
-      writeCachedCommandHash(accountId, botIdentity, currentHash);
+      await writeCachedCommandHash(accountId, botIdentity, currentHash);
       return;
     }
 
@@ -584,7 +607,7 @@ export function syncTelegramMenuCommands(params: {
         languageCode: variant.languageCode,
       });
     }
-    writeCachedCommandHash(accountId, botIdentity, currentHash);
+    await writeCachedCommandHash(accountId, botIdentity, currentHash);
   };
 
   void sync().catch((err: unknown) => {
