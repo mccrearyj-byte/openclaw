@@ -1,13 +1,48 @@
 // Telegram tests cover bot native command menu plugin behavior.
 import { expectDefined } from "@openclaw/normalization-core";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildCappedTelegramMenuCommands,
   buildPluginTelegramMenuCommands,
   syncTelegramMenuCommands,
 } from "./bot-native-command-menu.js";
+import { setTelegramRuntime } from "./runtime.js";
+import { clearTelegramRuntimeForTest } from "./runtime.test-support.js";
+import type { TelegramRuntime } from "./runtime.types.js";
 
 const TELEGRAM_COMMAND_TEXT_LIMIT = 5700;
+
+// The sync cache is persisted through the Telegram runtime's keyed state
+// store; stand it up with a plain in-memory map so the sync hash survives
+// across calls the way the real (SQLite-backed) store does across restarts.
+function useCommandMenuSyncStore() {
+  const entries = new Map<string, { hash: string }>();
+  const store = {
+    async register(key: string, value: { hash: string }) {
+      entries.set(key, value);
+    },
+    async lookup(key: string) {
+      return entries.get(key);
+    },
+    async delete(key: string) {
+      return entries.delete(key);
+    },
+  };
+  setTelegramRuntime({
+    state: {
+      openKeyedStore: (() => store) as unknown as TelegramRuntime["state"]["openKeyedStore"],
+    },
+    channel: {},
+  } as TelegramRuntime);
+}
+
+beforeEach(() => {
+  useCommandMenuSyncStore();
+});
+
+afterEach(() => {
+  clearTelegramRuntimeForTest();
+});
 
 function waitForTelegramMenu(assertion: () => void) {
   return vi.waitFor(assertion, { interval: 1 });
@@ -521,6 +556,69 @@ describe("bot-native-command-menu", () => {
       botIdentity: "bot-a",
     });
 
+    expect(setMyCommands).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips sync across a simulated gateway restart, using only the persisted store (#32017)", async () => {
+    const deleteMyCommands = vi.fn(async () => undefined);
+    const setMyCommands = vi.fn(async () => undefined);
+    const runtimeLog = vi.fn();
+
+    const accountId = `test-restart-${Date.now()}`;
+    const commands = [{ command: "restart_test", description: "Restart test command" }];
+
+    // Back the store with a Map created OUTSIDE any single sync call, then
+    // rebind the runtime to a fresh handler object between syncs. This is
+    // the same shape a real SQLite-backed store presents across a process
+    // restart: no in-memory module state survives, only the persisted rows.
+    const persistedEntries = new Map<string, { hash: string }>();
+    const bindRuntimeToPersistedStore = () => {
+      const store = {
+        async register(key: string, value: { hash: string }) {
+          persistedEntries.set(key, value);
+        },
+        async lookup(key: string) {
+          return persistedEntries.get(key);
+        },
+        async delete(key: string) {
+          return persistedEntries.delete(key);
+        },
+      };
+      setTelegramRuntime({
+        state: {
+          openKeyedStore: (() => store) as unknown as TelegramRuntime["state"]["openKeyedStore"],
+        },
+        channel: {},
+      } as TelegramRuntime);
+    };
+    bindRuntimeToPersistedStore();
+
+    syncMenuCommandsWithMocks({
+      deleteMyCommands,
+      setMyCommands,
+      runtimeLog,
+      commandsToRegister: commands,
+      accountId,
+      botIdentity: "bot-a",
+    });
+    await waitForTelegramMenu(() => expect(setMyCommands).toHaveBeenCalledTimes(2));
+
+    // Simulate the gateway process restarting: drop the runtime entirely and
+    // rebind a brand-new handler object, keeping only the persisted rows.
+    clearTelegramRuntimeForTest();
+    bindRuntimeToPersistedStore();
+
+    syncMenuCommandsWithMocks({
+      deleteMyCommands,
+      setMyCommands,
+      runtimeLog,
+      commandsToRegister: commands,
+      accountId,
+      botIdentity: "bot-a",
+    });
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(setMyCommands).toHaveBeenCalledTimes(2);
   });
 
